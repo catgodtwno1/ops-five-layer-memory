@@ -20,7 +20,7 @@ parser.add_argument("rounds", nargs="?", type=int, default=50,
                     help="測試輪次 (1-500，預設 50)")
 parser.add_argument("--memos-url", default="http://10.10.10.66:8765",
                     help="MemOS base URL (預設 NAS: http://10.10.10.66:8765)")
-parser.add_argument("--cognee-url", default="http://10.10.10.66:8766",
+parser.add_argument("--cognee-url", default="http://10.10.20.178:8000",
                     help="Cognee Sidecar base URL (預設 NAS: http://10.10.10.66:8766)")
 args = parser.parse_args()
 TOTAL_ROUNDS = max(1, min(500, args.rounds))
