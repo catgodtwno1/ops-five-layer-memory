@@ -142,30 +142,34 @@ for i in range(1, TOTAL_ROUNDS + 1):
     results.append((i, "L3", "health", ok, ms))
     if not ok: round_errors.append("L3/health")
 
-    # L3/login
-    token = ""
-    def do_login():
-        global token
+    # L3/login + search (combined to avoid closure/global token issues)
+    def do_login_and_search():
+        """Login then search in one function — token stays local, no closure."""
         resp = curl_json("POST", f"{COGNEE_URL}/api/v1/auth/login",
             data="username=default_user@example.com&password=default_password",
             headers=["Content-Type: application/x-www-form-urlencoded"], timeout=5)
         d = json.loads(resp)
-        token = d.get("access_token", "")
-        return len(token) > 0
-    ok, ms = timed_run(do_login)
-    results.append((i, "L3", "login", ok, ms))
-    if not ok: round_errors.append("L3/login")
-
-    # L3/search (404 = empty dataset, still means service works)
-    def do_search():
-        if not token: return False
+        tk = d.get("access_token", "")
+        if not tk:
+            return False, False, 0  # login_ok, search_ok, search_ms
+        search_t0 = time.monotonic()
         code = curl_status("POST", f"{COGNEE_URL}/api/v1/search",
             data=json.dumps({"query": "test", "search_type": "CHUNKS"}),
-            headers=[f"Authorization: Bearer {token}", "Content-Type: application/json"], timeout=5)
-        return code in ("200", "404")
-    ok, ms = timed_run(do_search)
-    results.append((i, "L3", "search", ok, ms))
-    if not ok: round_errors.append("L3/search")
+            headers=[f"Authorization: Bearer {tk}", "Content-Type: application/json"], timeout=5)
+        search_ms = int((time.monotonic() - search_t0) * 1000)
+        return True, code in ("200", "404"), search_ms
+
+    combo_t0 = time.monotonic()
+    try:
+        login_ok, search_ok, search_ms = do_login_and_search()
+    except Exception:
+        login_ok, search_ok, search_ms = False, False, 0
+    login_ms = int((time.monotonic() - combo_t0) * 1000) - search_ms
+
+    results.append((i, "L3", "login", login_ok, max(login_ms, 0)))
+    if not login_ok: round_errors.append("L3/login")
+    results.append((i, "L3", "search", search_ok, search_ms))
+    if not search_ok: round_errors.append("L3/search")
 
     # ═══ L3.5: MemOS ═══
     # L35/search
