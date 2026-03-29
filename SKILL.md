@@ -5,282 +5,219 @@ description: "Five-layer memory stack testing, benchmarking, and monitoring for 
 
 # Five-Layer Memory Stack Testing
 
-Test, benchmark, and monitor all 5 memory layers in OpenClaw.
+Test, benchmark, and monitor all memory layers in OpenClaw.
 
-## Layer Architecture
+## Layer Architecture (Updated 2026-03-29)
 
 | Layer | Name | Backend | LLM Provider | What It Stores |
 |-------|------|---------|--------------|----------------|
-| L1 | LCM | SQLite (`~/.openclaw/lcm.db`) | Claude Haiku-4-5 | Conversation summaries (DAG) |
-| L2 | LanceDB Pro | Lance files (`~/.openclaw/`) | Qwen2.5-32B-Instruct (SiliconFlow, ¥7-8/月) | Semantic memory (vector + BM25) |
-| L3 | Cognee Sidecar | Docker (LanceDB + Graph DB) | Qwen2.5-32B-Instruct (SiliconFlow, ¥7-8/月) | Knowledge graph + chunks |
-| L3.5 | MemOS | Docker (Neo4j + Qdrant) | Qwen2.5-32B-Instruct (SiliconFlow, ¥7-8/月) | Structured memory objects |
+| L1 | LCM | SQLite (`~/.openclaw/lcm.db`) | Claude Sonnet-4-6 (Anthropic) | Conversation summaries (DAG) |
+| L2 | LanceDB Pro | Lance files (`~/.openclaw/`) | Qwen2.5-32B-Instruct (SiliconFlow) | Semantic memory (vector + BM25 + reranker) |
+| L3 | Hindsight | Docker + native PostgreSQL | Qwen2.5-32B-Instruct (SiliconFlow) | Facts, entities, relationships (consolidation engine) |
 | L5 | Daily Files | Filesystem (`workspace/memory/`) | None | Raw daily notes |
 
-### LLM Provider Strategy (2026-03-26)
+### Architecture Change Log
 
-L2/L3/L3.5 all use **SiliconFlow Qwen2.5-32B-Instruct** (~¥7-8/月, 1000 RPM, ~1.5s latency). This avoids MiniMax 429 rate limiting caused by concurrent API calls across layers (L2+L3+L3.5 同時打 API 會超過 MiniMax C≥15 瞬時併發閾值). MiniMax M2.7-highspeed reserved for main session fallback and subagent conversations.
+- **2026-03-29**: MemOS removed from all 4 machines. Replaced by Hindsight (vectorize-io/hindsight). Cognee remains available but not actively tested in this skill.
+- **2026-03-27**: Cognee moved to sidecar role; L3.5 MemOS was primary structured memory.
+- **2026-03-26**: All layers migrated from MiniMax to SiliconFlow Qwen2.5-32B-Instruct.
 
-**Embedding**: SiliconFlow BAAI/bge-m3 (1024 dims) — shared across L2/L3/L3.5.
+### LLM Provider Strategy
 
-**MemOS Embedder**: Must set `MOS_EMBEDDER_BACKEND=universal_api` (default is `ollama`, will cause connection errors if Ollama not installed).
+All memory layers use **SiliconFlow** to avoid MiniMax 429 rate limiting from concurrent API calls across layers.
 
-## Quick Commands
+| Component | Model | Cost |
+|-----------|-------|------|
+| L1 LCM (summary + expansion) | Claude Sonnet-4-6 | Anthropic setup-token |
+| L2 LanceDB Pro (LLM + reranker) | Qwen2.5-32B-Instruct + bge-reranker-v2-m3 | SiliconFlow ~¥7-8/月 |
+| L3 Hindsight (retain/recall/consolidation) | Qwen2.5-32B-Instruct | SiliconFlow ~¥7-8/月 |
+| Embedding (L2 + L3 shared) | BAAI/bge-m3 (1024 dims) | SiliconFlow |
+| Main session / subagent | Claude Opus-4-6 / MiniMax M2.7-HS | Separate budgets |
 
-### Full Benchmark (50 rounds default)
+## Hindsight Deployment (L3)
+
+### Architecture
+
+```
+老大 (10.10.20.178)
+├── Docker: hindsight-docker (:9077 → container :8888)
+├── nginx proxy (:9078 → 127.0.0.1:9077) — LAN access
+├── Native PostgreSQL (:5432, user=hindsight, db=hindsight)
+└── Bank: openclaw (config overrides persisted via launchd)
+
+老二/老三/老四 → http://10.10.20.178:9078 (hindsightApiUrl)
+```
+
+### Docker Run Command
 
 ```bash
-python3 scripts/memory-5a-bench.py
+docker run -d --name hindsight-docker \
+  -p 9077:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_HOST=0.0.0.0 \
+  -e HINDSIGHT_API_PORT=8888 \
+  -e HINDSIGHT_API_DATABASE_URL=postgresql://hindsight:hindsight@host.docker.internal:5432/hindsight \
+  -e HINDSIGHT_API_DB_POOL_MAX_SIZE=50 \
+  -e HINDSIGHT_API_LLM_PROVIDER=openai \
+  -e HINDSIGHT_API_LLM_MODEL=Qwen/Qwen2.5-32B-Instruct \
+  -e HINDSIGHT_API_LLM_API_KEY=<SILICONFLOW_KEY> \
+  -e HINDSIGHT_API_LLM_BASE_URL=https://api.siliconflow.cn/v1 \
+  -e HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai \
+  -e HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=BAAI/bge-m3 \
+  -e HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=https://api.siliconflow.cn/v1 \
+  -e HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=<SILICONFLOW_KEY> \
+  -e HINDSIGHT_API_RERANKER_PROVIDER=litellm \
+  -e HINDSIGHT_API_RERANKER_LITELLM_MODEL=BAAI/bge-reranker-v2-m3 \
+  -e HINDSIGHT_API_RERANKER_LITELLM_API_BASE=https://api.siliconflow.cn/v1 \
+  -e HINDSIGHT_API_RERANKER_LITELLM_API_KEY=<SILICONFLOW_KEY> \
+  --restart unless-stopped \
+  ghcr.io/vectorize-io/hindsight:latest
 ```
 
-Options:
-- `python3 scripts/memory-5a-bench.py 300` — 300 rounds
-- `python3 scripts/memory-5a-bench.py 5 --smart` — use LLM-generated diverse test data
-- `--memos-url http://<MEMOS_HOST>:8765` — point to remote MemOS server
-- `--cognee-url http://<COGNEE_HOST>:8000` — point to remote Cognee server
+**Important env var names**: `EMBEDDINGS` (with S), not `EMBEDDING`.
 
-Output: per-layer pass/fail, avg/P50/P95/P99 latency, CSV at `/tmp/memory-5a-bench.csv`
+### Bank Config Optimizations
 
-### Smart Data Mode
-
-`--smart` generates diverse test memories (conversations, preferences, decisions) via MiniMax M2.7-HS. Data is cached in `scripts/bench-smart-data.json` (auto-generated at runtime, not committed) — subsequent runs reuse cached data without API calls.
+These must be applied after every container restart (PATCH API doesn't persist in Docker):
 
 ```bash
-# First run: generates data + benchmarks
-python3 scripts/memory-5a-bench.py 300 --smart
-
-# Second run: loads cached data, no API needed
-python3 scripts/memory-5a-bench.py 300 --smart
+curl -X PATCH http://127.0.0.1:9078/v1/default/banks/openclaw/config \
+  -H "Content-Type: application/json" \
+  -d '{"updates":{
+    "retain_extraction_mode": "detailed",
+    "consolidation_llm_batch_size": 4,
+    "consolidation_source_facts_max_tokens_per_observation": 2000
+  }}'
 ```
 
-### Quick Health Check (monitoring)
+A launchd plist (`ai.openclaw.hindsight-bank-init`) auto-injects these after boot.
 
-```bash
-bash scripts/memory-5a-monitor.sh
+### OpenClaw Plugin Config (openclaw.json)
+
+```json
+{
+  "plugins": {
+    "slots": { "memory": "memory-lancedb-pro" },
+    "entries": {
+      "hindsight-openclaw": {
+        "enabled": true,
+        "config": {
+          "hindsightApiUrl": "http://10.10.20.178:9078",
+          "recallTypes": ["world", "experience", "observation"],
+          "recallBudget": "mid",
+          "recallMaxTokens": 1024,
+          "dynamicBankId": false,
+          "retainEveryNTurns": 2,
+          "retainOverlapTurns": 1,
+          "autoRecall": true,
+          "autoRetain": true
+        }
+      }
+    }
+  }
+}
 ```
 
-Exit 0 = all OK, exit 1 = failures (prints alert message for cron pickup).
+**Note**: `hindsight-openclaw` plugin manifest must NOT have `"kind": "memory"` — this was removed on all 4 machines to allow it to coexist with memory-lancedb-pro as a sidecar.
 
-## Test Points Per Round (17 total)
+### MCP Tool Parameters (Correct)
 
-| Layer | Tests | What's Checked |
-|-------|-------|----------------|
-| L1 | count, content, fts, models, parents | SQLite row counts, FTS index, model diversity, DAG parents |
-| L2 | files, write, recall | Lance file existence, store API, recall API |
-| L3 | health, login, search | Cognee auth endpoint, token auth, CHUNKS search |
-| L3.5 | search, add | MemOS search + add APIs |
-| L5 | dir, list, write, read | Directory exists, .md files present, write+read roundtrip |
+| Tool | Key Params |
+|------|-----------|
+| retain | content, context, timestamp, tags, metadata, document_id, bank_id |
+| recall | query, max_tokens, budget, types, tags, bank_id |
+| list_memories | type, q, limit, offset, bank_id |
 
-## Deployment Modes — Choosing the Right Architecture
+**Endpoint**: POST `/mcp` (SSE). REST `/v1/...` endpoints return 405 for retain.
 
-The five-layer memory stack supports three deployment configurations:
+### nginx Proxy Config
 
-### Mode A — NAS Centralized (Recommended for multi-machine)
+Location: `/opt/homebrew/etc/nginx/servers/hindsight-proxy.conf`
 
-| Service | URL | Notes |
-|---------|-----|-------|
-| MemOS | `http://10.10.10.66:8765` | NAS 上的共享实例 |
-| Cognee | `http://10.10.10.66:8766` | NAS 上的共享实例 |
-
-**Pros**: unified data across all machines, easy management  
-**Cons**: NAS concurrent limit ~20 req/batch; 4×10 workers hits ceiling (→ use 4×5)
-
-```bash
-# 切换到模式A
-export MEMOS_URL=http://10.10.10.66:8765
-export COGNEE_URL=http://10.10.10.66:8766
-python3 scripts/memory-5a-bench.py 100
+```nginx
+upstream hindsight_backend {
+    server 127.0.0.1:9077;
+    keepalive 64;
+}
+server {
+    listen 9078;
+    location / {
+        proxy_pass http://hindsight_backend;
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+    }
+}
 ```
 
-### Mode B — Local Standalone (Single machine)
+## Performance Benchmarks
 
-| Service | URL | Notes |
-|---------|-----|-------|
-| MemOS | `http://127.0.0.1:8765` | 本机 Docker 启动 |
-| Cognee | `http://127.0.0.1:8000` | 本机 Docker 启动 |
+### Quality (10 business scenarios, 2026-03-29)
 
-**Pros**: no network dependency; **Cons**: no data sharing between machines
+| Method | Score | Notes |
+|--------|-------|-------|
+| recall (world+experience) | **10/10 = 100%** | After bank config optimization |
+| recall (+observation) | 10/10 = 100% | All type combos work |
+| list_memories (keyword) | 2/10 = 20% | Expected — consolidation rewrites raw text |
 
-```bash
-# 切换到模式B
-export MEMOS_URL=http://127.0.0.1:8765
-export COGNEE_URL=http://127.0.0.1:8000
-python3 scripts/memory-5a-bench.py
-```
+### Latency — Single Machine (localhost)
 
-### Mode C — Hybrid (Local service + NAS storage layer)
+| Concurrency | retain P50 | recall P50 | list P50 |
+|:-----------:|:----------:|:----------:|:--------:|
+| C=1 | 8ms | 1.3s | 9ms |
+| C=8 | 15ms | 2.5s | 19ms |
+| C=32 | 41ms | 2.7s | 39ms |
+| C=96 | 129ms | 8.9s | - |
 
-Run MemOS/Cognee as local Docker containers, but point their `.env` at NAS Neo4j/Qdrant for persistent vector/graph storage. Best of both worlds: local LLM speed + NAS durability.
+### Concurrency Limits
 
-```bash
-# 本地服务，NAS 存储
-# 修改 memos-server/.env:
-# NEO4J_URI=bolt://10.10.10.66:7687
-# QDRANT_URL=http://10.10.10.66:6333
-```
+| Scenario | Stable Limit | Notes |
+|----------|:------------:|-------|
+| Single machine | **C=96** (100%) | C=128 drops to ~95% |
+| 4 machines simultaneous | **C=32×4=128** (100%) | C=48×4=192 drops to ~80% |
+| Bottleneck | recall (LLM reranking) | retain/list stay sub-100ms at high C |
+| Real-world usage | ~4-12 QPS | 10x headroom from limit |
 
-### URL Resolution Order
+### Four-Machine Simultaneous (C=32×4=128, 2026-03-29)
 
-`memory-5a-bench.py` resolves URLs in this priority:
-
-1. **CLI flags:** `--memos-url` / `--cognee-url`
-2. **Environment variables:** `MEMOS_URL` / `COGNEE_URL`
-3. **Auto-detect**: script checks if `127.0.0.1:8765` is reachable → uses local if yes, NAS if no
-4. **Fallback default**: `http://10.10.10.66:8765` (NAS) — auto-detect always runs first
-
-### Four-Machine Concurrent Testing
-
-```bash
-# 四台机器同时跑，各 5 workers = 20 并发（约 20-30s/batch）
-# 在任一台机器上：
-bash scripts/concurrent-memory-test.sh 10
-
-# 自定义 workers 数量（减少以避开 NAS 上限）：
-ROUNDS=10 MEMOS_URL=http://10.10.10.66:8765 bash scripts/concurrent-memory-test.sh 10
-```
-
-### Per-machine setup (recommended)
-
-Add to `~/.zshrc` or `~/.bashrc` on each machine:
-
-```bash
-# Scott#1 (local services)
-# No env needed — defaults to 127.0.0.1
-
-# Scott#3 / Scott#4 (remote, pointing to Scott#1)
-export MEMOS_URL=http://<MEMOS_HOST>:8765
-export COGNEE_URL=http://<COGNEE_HOST>:8000
-
-# NAS endpoints (if using NAS as backend)
-# export MEMOS_URL=http://<NAS_HOST>:8765
-# export COGNEE_URL=http://<NAS_HOST>:8766
-```
-
-This way `python3 scripts/memory-5a-bench.py` just works on any machine without flags.
-
-## Setting Up Cron Monitoring
-
-Create an OpenClaw cron job to run the monitor every hour:
-
-```
-/cron add --every 60m --label "memory-health" -- bash ~/.openclaw/workspace/skills/ops-five-layer-memory/scripts/memory-5a-monitor.sh
-```
-
-The monitor script outputs alerts only on failure — cron delivers them to your configured channel.
-
-## Interpreting Results
-
-**Healthy baseline (Scott#1 local, Qwen2.5-7B, 300 rounds 2026-03-26):**
-- L1: P50=9ms, P95=16ms (local SQLite)
-- L2: P50=6ms write, P50=5ms recall (local LanceDB)
-- L3: P50=56ms login, P50=19ms search (local Cognee)
-- L3.5: P50=73ms add, P50=91ms search (local MemOS, 4 workers)
-- L5: < 1ms (local filesystem)
-
-**Healthy baseline (remote from Scott#3, 100 rounds):**
-- L2: P50=18ms (local LanceDB)
-- L3: P50=57ms search (network hop to Scott#1)
-- L3.5: P50=113ms add (network hop to Scott#1)
-
-**Common failures:**
-- L3 health fails → Cognee container down (`docker restart oc-cognee-api`)
-- L3 search 401 → wrong Cognee instance (check `--cognee-url` / `COGNEE_URL`)
-- L3.5 search fails → MemOS container or Neo4j down
-- L3.5 add timeout (30s+) → Neo4j memory dedup O(n) scan; clean bench garbage (see Maintenance below)
-- L1 count = 0 → LCM never ran compaction (check `summaryModel` config)
-- L2 no .lance files → LanceDB Pro plugin not enabled
-
-## Maintenance
-
-### Cleaning Bench Garbage from MemOS
-
-Stress tests leave test memories in Neo4j. Over time this causes MemOS add latency to degrade from ~80ms to 30s+ (Neo4j dedup does O(n) full-table scans).
-
-```bash
-# Count bench garbage
-docker exec memos-neo4j cypher-shell -u neo4j -p 12345678 \
-  "MATCH (n:Memory) WHERE n.memory CONTAINS 'bench' RETURN count(n)"
-
-# Delete bench garbage
-docker exec memos-neo4j cypher-shell -u neo4j -p 12345678 \
-  "MATCH (n:Memory) WHERE n.memory CONTAINS 'bench' DETACH DELETE n RETURN count(*)"
-
-# Restart MemOS after cleanup
-docker restart memos-api
-```
-
-### MemOS Configuration (docker-compose.yml)
-
-Key settings for stability:
-```yaml
-command: uvicorn main:app --host 0.0.0.0 --port 8765 --workers 4  # multi-worker prevents blocking
-environment:
-  ASYNC_MODE: async  # avoid sync mode which forces LLM extraction (10-15s delay)
-  MOS_CHAT_MODEL: Qwen/Qwen2.5-32B-Instruct  # SiliconFlow ~¥7-8/月
-  MEMRADER_MODEL: Qwen/Qwen2.5-32B-Instruct
-  MOS_EMBEDDER_BACKEND: universal_api  # ⚠️ 必須設！默認 ollama 會報錯
-```
-
-### Cognee Configuration
-
-Key settings:
-```
-LLM_MODEL=openai/Qwen/Qwen2.5-32B-Instruct
-DEFAULT_SEARCH_TYPE=CHUNKS  # pure vector, no LLM graph completion
-```
-Container must bind `0.0.0.0:8000` (not 127.0.0.1) for remote access.
+All 100% pass, zero failures:
+- Scott1 (localhost): retain P50=41ms, recall P50=2.7s
+- Scott2 (LAN): retain P50=226ms, recall P50=4.0s
+- Scott3 (LAN): retain P50=271ms, recall P50=4.1s
+- Scott4 (LAN): retain P50=2062ms, recall P50=3.3s
 
 ## Known Issues
 
-- **L2 filesystem scan latency spike:** `L2/files` test runs `find ~/.openclaw/ -name '*.lance'` which can hit 3s+ on cold cache. Actual LanceDB write latency is ~7ms. This is a test artifact, not a functional issue.
-- **Cognee login+search combined:** These two operations share a single function (`do_login_and_search()`) to avoid Python closure bugs with the auth token. Login and search latencies are still reported separately.
-- **NAS vs local Cognee auth:** NAS Cognee and local Cognee are separate instances with independent auth. Login tokens are NOT interchangeable.
-- **Neo4j memory accumulation:** MemOS add latency degrades with total memory count due to O(n) dedup scans. Keep total memories under ~2000 for <100ms add latency. Run cleanup periodically.
+### macOS Tahoe Python LAN Socket Bug (老二)
 
-## Benchmark History
+Homebrew Python 3.14 (adhoc-signed) can get silently blocked from LAN connections by macOS Tahoe's `networkserviceproxy`. Symptoms: `Errno 65 No route to host` for LAN IPs only, `curl`/`nc`/Node.js unaffected.
 
-| Date | Rounds | Pass Rate | L3.5 P50 | Notes |
-|------|--------|-----------|----------|-------|
-| 2026-03-26 | 300 | **100%** (5100/5100) | 82ms | Qwen2.5-7B, 4 workers, post-cleanup |
-| 2026-03-26 | 500 | 99.6% (8468/8500) | 88ms | MiniMax→Qwen2.5-7B migration day |
-| 2026-03-25 | 100 | 100% (1700/1700) | 110ms | Scott#1 local, MiniMax M2.7-HS |
-| 2026-03-25 | 100 | 47.1% (800/1700) | 113ms | Scott#3 remote (L1/L5 path mismatch) |
+**Root cause**: Previous `codesign --force` operation cached a rejection in `networkserviceproxy` memory.
 
-## Concurrent Multi-Machine Test
-
-四台机器同时并发测试 MemOS + Cognee，验证共享后端在并发负载下的稳定性。
-
-### 用法
-
+**Fix**:
 ```bash
-bash scripts/concurrent-memory-test.sh [rounds] [--memos-only|--cognee-only]
+sudo killall networkserviceproxy nesessionmanager symptomsd mDNSResponder
 ```
+Processes auto-restart via launchd with clean state. Does NOT require Python reinstall.
 
-- `bash scripts/concurrent-memory-test.sh 10` — 10 轮，测 MemOS + Cognee
-- `bash scripts/concurrent-memory-test.sh 50` — 50 轮压测
-- `bash scripts/concurrent-memory-test.sh 10 --memos-only` — 只测 MemOS
-- `bash scripts/concurrent-memory-test.sh 10 --cognee-only` — 只测 Cognee
+### Hindsight Docker PATCH Config Not Persistent
 
-### 测试点
+Bank config overrides applied via PATCH API are lost on container restart. Use the launchd plist (`ai.openclaw.hindsight-bank-init`) for auto-injection.
 
-| 层 | 操作 | 说明 |
-|---|---|---|
-| MemOS | add | 写入记忆（/product/add） |
-| MemOS | search | 搜索记忆（/product/search） |
-| Cognee | health | 健康检查（/api/v1/settings） |
-| Cognee | login | 登录获取 token（/api/v1/auth/login） |
-| Cognee | search | CHUNKS 搜索（/api/v1/search） |
-| Cognee | search2 | 第二次搜索（验证并发稳定性） |
+### Embedding Dimension Mismatch (Historical)
 
-### 架构
+Earlier Hindsight Docker used default 384-dim embeddings. Current Docker is configured with `BAAI/bge-m3` (1024-dim). If migrating from old data, truncate the DB first.
 
-- 四台机器通过 SSH 并行启动 worker.py
-- 所有机器同时访问老大（10.10.20.178）上的 MemOS 和 Cognee 服务
-- 输出按层汇总 Pass/Fail/P50/P95/Max
+## Deprecated Components
 
-### Baseline (2026-03-27, 10 轮 × 4 台)
+### MemOS (Removed 2026-03-29)
 
-| 层 | Pass | Fail | 说明 |
-|---|---|---|---|
-| MemOS | 80/80 | 0 | add P50=81ms, search P50=235ms |
-| Cognee | 160/160 | 0 | health P50=42ms, search P50=119ms |
+MemOS was removed from all 4 machines due to persistent issues:
+- API key injection failures in Docker env vars
+- Neo4j dedup O(n²) causing 30s+ add latency
+- WorkingMemory routing bugs (search returning 0 results)
+- Slow writes (~8s at C=1 with LLM extraction)
+
+Docker containers `memos-api`, `memos-neo4j`, `memos-qdrant` have been stopped and removed. The `memos-openclaw` plugin entry has been deleted from all machines' openclaw.json.
+
+### Cognee (Available but not primary)
+
+Cognee sidecar remains installed but is not actively monitored by this skill. It operates independently as a knowledge graph indexer.
