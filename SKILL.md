@@ -13,7 +13,8 @@ Test, benchmark, and monitor all memory layers in OpenClaw.
 |-------|------|---------|--------------|----------------|
 | L1 | LCM | SQLite (`~/.openclaw/lcm.db`) | Claude Sonnet-4-6 (Anthropic) | Conversation summaries (DAG) |
 | L2 | LanceDB Pro | Lance files (`~/.openclaw/`) | Qwen2.5-32B-Instruct (SiliconFlow) | Semantic memory (vector + BM25 + reranker) |
-| L3 | Hindsight | Docker + native PostgreSQL | Qwen2.5-32B-Instruct (SiliconFlow) | Facts, entities, relationships (consolidation engine) |
+| L3 | Hindsight | Docker + native PostgreSQL | **MiniMax-M2.7-highspeed** | Facts, entities, relationships (consolidation engine) |
+| L3.5 | Cognee | Docker (cognee-fixed:v5) | **MiniMax-M2.7-highspeed** | Knowledge graph (entities + relationships via KG extraction) |
 | L5 | Daily Files | Filesystem (`workspace/memory/`) | None | Raw daily notes |
 
 ### Architecture Change Log
@@ -24,15 +25,25 @@ Test, benchmark, and monitor all memory layers in OpenClaw.
 
 ### LLM Provider Strategy
 
-All memory layers use **SiliconFlow** to avoid MiniMax 429 rate limiting from concurrent API calls across layers.
+Hindsight 和 Cognee 已從 SiliconFlow Qwen2.5-32B 切換至 **MiniMax M2.7-HS**（解決 TPM rate limit 問題）。
 
-| Component | Model | Cost |
-|-----------|-------|------|
-| L1 LCM (summary + expansion) | Claude Sonnet-4-6 | Anthropic setup-token |
-| L2 LanceDB Pro (LLM + reranker) | Qwen2.5-32B-Instruct + bge-reranker-v2-m3 | SiliconFlow ~¥7-8/月 |
-| L3 Hindsight (retain/recall/consolidation) | Qwen2.5-32B-Instruct | SiliconFlow ~¥7-8/月 |
-| Embedding (L2 + L3 shared) | BAAI/bge-m3 (1024 dims) | SiliconFlow |
-| Main session / subagent | Claude Opus-4-6 / MiniMax M2.7-HS | Separate budgets |
+| Component | Model | Provider | Cost |
+|-----------|-------|----------|------|
+| L1 LCM (summary + expansion) | Claude Haiku-4-5 | Anthropic setup-token | 低 |
+| L2 LanceDB Pro (LLM + reranker) | Qwen2.5-32B-Instruct + bge-reranker-v2-m3 | SiliconFlow | ~¥7-8/月 |
+| L3 Hindsight (retain/recall/consolidation) | **MiniMax-M2.7-highspeed** | MiniMax api.minimaxi.com | Coding Plan 含 |
+| L3.5 Cognee (knowledge graph) | **MiniMax-M2.7-highspeed** | MiniMax api.minimaxi.com | Coding Plan 含 |
+| Embedding (L2 + L3 + Cognee shared) | BAAI/bge-m3 (1024 dims) | SiliconFlow | 免費 |
+| Main session / subagent | Claude Opus-4-6 / MiniMax M2.7-HS | 各自 | 各自 |
+
+### 2026-03-31 變更：Hindsight + Cognee LLM 切至 M2.7-HS
+
+- **原因**：SiliconFlow Qwen2.5-32B 免費 tier TPM 限制太低，batch cognify/consolidation 頻繁 429
+- **M2.7-HS 注意**：reasoning model，reasoning_tokens 消耗 max_tokens budget
+  - Cognee KG extraction 需要 max_tokens≥8192（reasoning ~3000 + JSON output ~3000+）
+  - Hindsight 無此問題（output 較短）
+- **M2.1-HS 不可用**：thinking.enabled=false 無效，所有 tokens 被 `<think>` 吃掉
+- **M2.5-HS 備選**：可用但不穩定（nondeterministic truncation）
 
 ## Hindsight Deployment (L3)
 
@@ -58,9 +69,9 @@ docker run -d --name hindsight-docker \
   -e HINDSIGHT_API_DATABASE_URL=postgresql://hindsight:hindsight@host.docker.internal:5432/hindsight \
   -e HINDSIGHT_API_DB_POOL_MAX_SIZE=50 \
   -e HINDSIGHT_API_LLM_PROVIDER=openai \
-  -e HINDSIGHT_API_LLM_MODEL=Qwen/Qwen2.5-32B-Instruct \
-  -e HINDSIGHT_API_LLM_API_KEY=<SILICONFLOW_KEY> \
-  -e HINDSIGHT_API_LLM_BASE_URL=https://api.siliconflow.cn/v1 \
+  -e HINDSIGHT_API_LLM_MODEL=MiniMax-M2.7-highspeed \
+  -e HINDSIGHT_API_LLM_API_KEY=<MINIMAX_API_KEY> \
+  -e HINDSIGHT_API_LLM_BASE_URL=https://api.minimaxi.com/v1 \
   -e HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai \
   -e HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=BAAI/bge-m3 \
   -e HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=https://api.siliconflow.cn/v1 \
@@ -218,6 +229,24 @@ MemOS was removed from all 4 machines due to persistent issues:
 
 Docker containers `memos-api`, `memos-neo4j`, `memos-qdrant` have been stopped and removed. The `memos-openclaw` plugin entry has been deleted from all machines' openclaw.json.
 
-### Cognee (Available but not primary)
+### Cognee (L3.5 — Active Sidecar)
 
-Cognee sidecar remains installed but is not actively monitored by this skill. It operates independently as a knowledge graph indexer.
+Cognee 作為知識圖譜索引器活躍運行，配置已更新：
+- LLM: MiniMax M2.7-HS (max_tokens=8192)
+- Embedding: SiliconFlow BAAI/bge-m3
+- Docker image: `cognee-fixed:v5`（含 message role order + embedding dimensions 兩個 patch）
+- Port: `0.0.0.0:8000`（LAN 可達，四台機器共用）
+- Dataset: `openclaw-main-v7`
+- searchType: `CHUNKS`（避免 GRAPH_COMPLETION timeout）
+
+詳見 `ops-cognee-rollout` skill。
+
+### NAS 備份架構
+
+NAS (10.10.10.66) 部署了完整 Docker stack 作為冷備：
+- oc-neo4j：3,671 Memory nodes（legacy MemOS 數據）
+- oc-postgres：Hindsight DB，1,712+ memories
+- oc-cognee：M2.7-HS，含已匯入的 3,486 條 legacy Qdrant 數據
+- oc-hindsight：M2.7-HS
+
+本機（老大）為主力，NAS 為災備。不支持雙連接（每個插件只能指一個 baseUrl）。
